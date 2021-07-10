@@ -1,8 +1,11 @@
 ##
-## Plug-in for installing Ubuntu Focal.
+## Plug-in for installing Debian 10 (Buster).
 ##
 
-DISTRO_NAME="Ubuntu 20.04"
+DISTRO_NAME="Debian 10 (Buster)"
+
+# Rootfs is in subdirectory.
+DISTRO_TARBALL_STRIP_OPT=1
 
 # You can override a CPU architecture to let distribution
 # be executed by QEMU (user-mode).
@@ -21,29 +24,29 @@ DISTRO_NAME="Ubuntu 20.04"
 # Returns download URL and SHA-256 of file in this format:
 # SHA-256|FILE-NAME
 get_download_url() {
-	local rootfs
+	local deb_arch
 	local sha256
 
 	case "$DISTRO_ARCH" in
 		aarch64)
-			rootfs="https://github.com/termux/proot-distro/releases/download/v1.2-ubuntu-focal-rootfs/ubuntu-focal-core-cloudimg-arm64-root-2020.12.10.tar.gz"
-			sha256="426a0345245ab95491bc78073b7f2f2ea91acd65b001eb9d6b8709eb1a5ba642"
+			deb_arch="arm64"
+			sha256="c9e87d21eea22d5eec3681508b84cf1f48dfeb2e7178c65c5bd755d56600936a"
 			;;
 		armv7l|armv8l)
-			rootfs="https://github.com/termux/proot-distro/releases/download/v1.2-ubuntu-focal-rootfs/ubuntu-focal-core-cloudimg-armhf-root-2020.12.10.tar.gz"
-			sha256="eb9ac4f4ee33071d25e95cd6b62dedfb57aa2f9449c6160f46a27fbf78bc821e"
+			deb_arch="armhf"
+			sha256="35f29b0568b1c1d7d9d1263245834d2dce8c5fa5b78b64c72a79349585b06690"
 			;;
 		i686)
-			# Ubuntu Focal does not provide tarballs for x86 32bit.
-			return
+			deb_arch="i386"
+			sha256="c74b2b9771ba5ad693a2d8ee5600b0373ffad3f6a548f71bbb9516cd7b1d2e43"
 			;;
 		x86_64)
-			rootfs="https://github.com/termux/proot-distro/releases/download/v1.2-ubuntu-focal-rootfs/ubuntu-focal-core-cloudimg-amd64-root-2020.12.10.tar.gz"
-			sha256="c7f50b2e87f172e0c0d1c3fe38fcfc7ca33d62d20ef41dc185e20d19e4d4aa59"
+			deb_arch="amd64"
+			sha256="968e753aafc2b94fd4f94729b3453d7515cf4ab647a6db38ed0b80af0e9c5720"
 			;;
 	esac
 
-	echo "${sha256}|${rootfs}"
+	echo "${sha256}|https://github.com/termux/proot-distro/releases/download/v1.4.0-debian-rootfs/debian-buster-${deb_arch}-2021.01.10.tar.gz"
 }
 
 # Define here additional steps which should be executed

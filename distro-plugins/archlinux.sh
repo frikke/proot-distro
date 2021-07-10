@@ -1,32 +1,54 @@
 ##
-## Plug-in for installing Arch Linux (original and ARM variants).
+## Plug-in for installing Arch Linux.
+##
+## Warning: Arch Linux ARM is not Arch Linux! This is a different project,
+## yet it is a lot similar to the original. Proot-Distro considers them as
+## equal to make things easier.
 ##
 
 DISTRO_NAME="Arch Linux"
 
+# You can override a CPU architecture to let distribution
+# be executed by QEMU (user-mode).
+#
+# You can specify the following values here:
+#
+#  * aarch64: AArch64 (ARM64, 64bit ARM)
+#  * armv7l:  ARM (32bit)
+#  * i686:    x86 (32bit)
+#  * x86_64:  x86 (64bit)
+#
+# Default value is set by proot-distro script and is equal
+# to the CPU architecture of your device (uname -m).
+#DISTRO_ARCH=$(uname -m)
+
 # x86_64 rootfs is inside subdirectory.
-if [ "$(uname -m)" = "x86_64" ]; then
+if [ "$DISTRO_ARCH" = "x86_64" ]; then
 	DISTRO_TARBALL_STRIP_OPT=1
 fi
 
-# Returns download URL.
+# Returns download URL and SHA-256 of file in this format:
+# SHA-256|FILE-NAME
 get_download_url() {
-	case "$(uname -m)" in
+	local rootfs
+	local sha256
+
+	case "$DISTRO_ARCH" in
 		aarch64)
-			echo "https://eu.mirror.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
+			rootfs="https://github.com/termux/proot-distro/releases/download/v1.2-arch-rootfs/ArchLinuxARM-aarch64-2020.12.10.tar.gz"
+			sha256="e1ae234a381097674d7d2445c79b13c43e0c39a61a6c6839a3b984d2e9bb0804"
 			;;
 		armv7l|armv8l)
-			echo "https://eu.mirror.archlinuxarm.org/os/ArchLinuxARM-armv7-latest.tar.gz"
+			rootfs="https://github.com/termux/proot-distro/releases/download/v1.2-arch-rootfs/ArchLinuxARM-armv7-2020.12.10.tar.gz"
+			sha256="1e5923b8065f98df77189fdf4e9a07d6b9e15d86563bf9cd1716dced9cdb2aab"
 			;;
 		x86_64)
-			# File name of x86_64 tarball is not persistent, so generate URL in hacky way.
-			local file_name
-			file_name=$(curl --fail --silent "https://mirror.rackspace.com/archlinux/iso/latest/md5sums.txt" | grep bootstrap | awk '{ print $2 }')
-			if [ -n "$file_name" ]; then
-				echo "http://mirror.rackspace.com/archlinux/iso/latest/${file_name}"
-			fi
+			rootfs="https://github.com/termux/proot-distro/releases/download/v1.2-arch-rootfs/archlinux-bootstrap-2020.12.01-x86_64.tar.gz"
+			sha256="c08fd2eca091b8b5fcf61ed39ccad7c1ddeae0a9b93e57c401bb60953a7337f1"
 			;;
 	esac
+
+	echo "${sha256}|${rootfs}"
 }
 
 # Define here additional steps which should be executed
@@ -54,13 +76,10 @@ distro_setup() {
 	# Uninstall packages which are not necessary.
 	case "$(uname -m)" in
 		aarch64)
-			run_proot_cmd pacman -Rnsc --noconfirm dbus linux-aarch64 systemd
+			run_proot_cmd pacman -Rnsc --noconfirm linux-aarch64
 			;;
 		armv7l|armv8l)
-			run_proot_cmd pacman -Rnsc --noconfirm dbus linux-armv7 systemd
-			;;
-		x86_64)
-			run_proot_cmd pacman -Rnsc --noconfirm dbus systemd
+			run_proot_cmd pacman -Rnsc --noconfirm linux-armv7
 			;;
 	esac
 }
