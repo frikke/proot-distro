@@ -1,0 +1,324 @@
+# Containment tests for the environment handed to the host-side proot exec.
+#
+# proot has no way to set the guest's environment on its own: the dict
+# passed to os.execvpe(proot_bin, ...) is proot's own, and proot passes it
+# on to the tracee. So a name that means "a setting for the container" to
+# whoever wrote it means "a setting for the process that has not confined
+# anything yet" to the dynamic loader. An image that gets to set
+# LD_LIBRARY_PATH (or LD_AUDIT, or LD_PRELOAD) ships a libtalloc.so.2 at a
+# path it also controls and runs its own code as the invoking user,
+# outside any container — no race, no concurrent session, and in every
+# mode, `--isolated` and `--minimal` included. PROOT_* is the same story
+# for proot's own knobs.
+#
+# The rule is about provenance, not about the name: the user's own
+# environment and their own --env flags still reach proot, because they
+# already control the command line.
+
+import json
+from types import SimpleNamespace
+
+import pytest
+
+import _builders
+
+from proot_distro.arch import get_device_cpu_arch
+from proot_distro.commands.build import command_build
+from proot_distro.commands.login import command_login
+from proot_distro.execenv import (
+    MAX_ENV_STRING_BYTES, is_exportable, is_host_exec_var,
+)
+from proot_distro.helpers.build_engine.engine import _adopt_image_config
+from proot_distro.helpers.build_engine import run_step
+from proot_distro.helpers.build_engine.handlers import do_env
+
+
+HOST_ARCH = get_device_cpu_arch()
+
+HOSTILE_ENV = [
+    "LD_LIBRARY_PATH=/evil/lib",
+    "LD_PRELOAD=/evil/pre.so",
+    "LD_AUDIT=/evil/audit.so",
+    "PROOT_NO_SECCOMP=1",
+    "PROOT_L2S_DIR=/evil/l2s",
+    "LANG=C.UTF-8",
+]
+
+
+# --- the predicate ---------------------------------------------------------
+
+@pytest.mark.parametrize("key", [
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_BIND_NOW",
+    "LD_SOMETHING_LIBC_ADDS_LATER",
+    "PROOT_NO_SECCOMP", "PROOT_VERBOSE", "PROOT_L2S_DIR", "PROOT_TMP_DIR",
+])
+def test_host_exec_vars_are_matched_by_family(key):
+    # A list would go stale: LD_AUDIT was already missing from the one
+    # that existed, so the namespaces are matched by prefix.
+    assert is_host_exec_var(key)
+
+
+@pytest.mark.parametrize("key", [
+    "LANG", "PATH", "HOME", "TERM", "LDAP_URI", "PROOTLESS",
+])
+def test_ordinary_vars_are_not(key):
+    assert not is_host_exec_var(key)
+
+
+@pytest.mark.parametrize("key,value", [
+    ("A", "b\x00c"),                              # ValueError at execve
+    ("A\x00", "b"),
+    ("A", "\ud800"),                              # UnicodeEncodeError
+    ("A", "x" * MAX_ENV_STRING_BYTES),           # E2BIG, one string
+    ("A", "x" * (MAX_ENV_STRING_BYTES - 2)),     # "A=" + x's + NUL: one over
+])
+def test_what_cannot_be_an_environment_string(key, value):
+    assert not is_exportable(key, value)
+
+
+@pytest.mark.parametrize("key,value", [
+    ("A", ""), ("A", "b=c"), ("A", "\udcff"),     # surrogateescape's own
+    ("A", "x" * (MAX_ENV_STRING_BYTES - 3)),     # exactly fits
+])
+def test_what_can(key, value):
+    assert is_exportable(key, value)
+
+
+# --- login -----------------------------------------------------------------
+
+def _login_env(container_name, capsys, *, extra_env=(), **over):
+    """Return the child environment login would exec proot with."""
+    return _builders.login_child_env(
+        command_login,
+        _builders.login_args(container_name, env=list(extra_env), **over),
+        capsys,
+    )
+
+
+@pytest.fixture
+def hostile_image(builders):
+    builders.make_container(
+        "box", arch=HOST_ARCH,
+        manifest=builders.simple_image_manifest(env=HOSTILE_ENV),
+    )
+
+
+def test_image_env_cannot_reach_the_exec(hostile_image, capsys, monkeypatch):
+    for var in ("PROOT_NO_SECCOMP", "PROOT_VERBOSE"):
+        monkeypatch.delenv(var, raising=False)
+    env = _login_env("box", capsys)
+    assert not [k for k in env if is_host_exec_var(k)]
+    # The rest of the image's Env still applies — this is a filter, not a
+    # refusal to read the manifest.
+    assert env["LANG"] == "C.UTF-8"
+
+
+@pytest.mark.parametrize("isolated,minimal", [(True, False), (False, True)])
+def test_image_env_is_blocked_in_every_mode(hostile_image, capsys,
+                                            monkeypatch, isolated, minimal):
+    # Image Env applies in isolated and minimal too, so the filter has to.
+    for var in ("PROOT_NO_SECCOMP", "PROOT_VERBOSE"):
+        monkeypatch.delenv(var, raising=False)
+    env = _login_env("box", capsys, isolated=isolated, minimal=minimal)
+    assert not [k for k in env if is_host_exec_var(k)]
+
+
+def test_the_users_own_environment_still_reaches_proot(hostile_image, capsys,
+                                                       monkeypatch):
+    """`PROOT_NO_SECCOMP=1 proot-distro login debian` keeps working."""
+    monkeypatch.setenv("PROOT_NO_SECCOMP", "1")
+    monkeypatch.setenv("PROOT_VERBOSE", "2")
+    env = _login_env("box", capsys)
+    assert env["PROOT_NO_SECCOMP"] == "1"
+    assert env["PROOT_VERBOSE"] == "2"
+    # The image's own attempt at the same name did not decide it.
+    assert "LD_LIBRARY_PATH" not in env
+
+
+def test_the_users_own_env_flags_still_apply(hostile_image, capsys,
+                                             monkeypatch):
+    monkeypatch.delenv("PROOT_NO_SECCOMP", raising=False)
+    env = _login_env("box", capsys, extra_env=[
+        "LD_LIBRARY_PATH=/opt/lib", "PROOT_NO_SECCOMP=1",
+    ])
+    assert env["LD_LIBRARY_PATH"] == "/opt/lib"
+    assert env["PROOT_NO_SECCOMP"] == "1"
+
+
+def test_ld_preload_stays_dropped_from_every_source(hostile_image, capsys):
+    env = _login_env("box", capsys, extra_env=["LD_PRELOAD=/x.so"])
+    assert "LD_PRELOAD" not in env
+
+
+def test_image_env_cannot_forge_the_identity_vars(builders, capsys):
+    """An image does not get to say which container it is running in.
+
+    PD_CONTAINER / PD_IMAGE / PD_IMAGE_ID / container are the program's
+    answer to the guest, read from the container's own name and its
+    manifest; an Env entry under any of those names is refused like
+    TERM is. `container=oci` is a real one -- Fedora and UBI images ship
+    it -- and it is less true here than the marker this program sets.
+    """
+    manifest = builders.simple_image_manifest(env=[
+        "PD_CONTAINER=evil", "PD_IMAGE=evil", "PD_IMAGE_ID=evil",
+        "container=oci", "LANG=C.UTF-8",
+    ])
+    manifest["manifest"]["config"] = {"digest": "sha256:" + "ab" * 32}
+    builders.make_container("box", arch=HOST_ARCH, manifest=manifest)
+    env = _login_env("box", capsys)
+    assert env["PD_CONTAINER"] == "box"
+    assert env["PD_IMAGE"] == "test:latest"
+    assert env["PD_IMAGE_ID"] == "sha256:" + "ab" * 32
+    assert env["container"] == "proot-distro"
+    assert env["LANG"] == "C.UTF-8"
+
+
+# --- build -----------------------------------------------------------------
+
+def test_pulled_base_config_is_filtered_at_adoption():
+    """Filtered where a stranger's config is adopted, not where it is used.
+
+    Everything downstream reads this list — the stage's env is seeded
+    from it at FROM, `FROM <earlier stage>` deep-copies it, and the
+    built image's own config comes from it — so one filter keeps all of
+    them clean.
+    """
+    cfg = _adopt_image_config({"config": {"Env": list(HOSTILE_ENV)}}, "img")
+    assert cfg["config"]["Env"] == ["LANG=C.UTF-8"]
+
+
+def test_pulled_base_env_that_cannot_be_exported_is_dropped_at_adoption():
+    cfg = _adopt_image_config({"config": {"Env": [
+        "NUL=a\x00b", "SUR=\ud800", "BIG=" + "x" * 200_000, "OK=1",
+    ]}}, "img")
+    assert cfg["config"]["Env"] == ["OK=1"]
+
+
+def test_adopt_tolerates_the_shapes_a_registry_really_sends():
+    for weird in ({}, {"config": None}, {"config": {}},
+                  {"config": {"Env": None, "Cmd": None, "Labels": None}}):
+        adopted = _adopt_image_config(json.loads(json.dumps(weird)), "img")
+        assert isinstance(adopted["config"], dict)
+
+
+class _Stage:
+    def __init__(self):
+        self.image_config = {"config": {}}
+        self.env = {}
+        self.args = {}
+        self.declared_args = set()
+        self.rootfs_dir = ""
+        self.base_ref = ""
+        self.base_image_id = ""
+        self.rootfs_fd = None
+
+
+class _Engine:
+    def __init__(self, firing):
+        self.current = _Stage()
+        self._firing_onbuild = firing
+
+
+def _run_env(firing, value="LD_LIBRARY_PATH=/opt/lib SAFE=1"):
+    engine = _Engine(firing)
+    do_env(engine, {"value": value, "exec_form": False})
+    return engine.current
+
+
+def test_onbuild_env_from_the_base_image_is_filtered():
+    """A trigger that fires is the image's line, never the author's."""
+    stage = _run_env(firing=True)
+    assert stage.env == {"SAFE": "1"}
+    # Dropped from the produced config too, so it is not carried on to
+    # whoever runs the built image next.
+    assert stage.image_config["config"]["Env"] == ["SAFE=1"]
+
+
+def test_an_authors_own_env_line_is_left_alone():
+    """`ENV LD_LIBRARY_PATH=/opt/lib` is ordinary in a Dockerfile."""
+    stage = _run_env(firing=False)
+    assert stage.env["LD_LIBRARY_PATH"] == "/opt/lib"
+    assert "LD_LIBRARY_PATH=/opt/lib" in stage.image_config["config"]["Env"]
+
+
+def test_build_keeps_an_authors_env_in_the_produced_image(tmp_path, builders):
+    ctx = tmp_path / "ctx"
+    ctx.mkdir()
+    (ctx / "Dockerfile").write_text(
+        "FROM scratch\n"
+        "ENV LD_LIBRARY_PATH=/opt/lib\n"
+        "ENV SAFE=1\n"
+    )
+    command_build(SimpleNamespace(
+        path=str(ctx), dockerfile=None, tags=["envimg:1"], build_args=[],
+        override_arch=None, target_stage=None, emulator=None, outputs=[],
+        install_as=None, no_cache=False, verbose=False, quiet=True,
+    ))
+    from proot_distro.helpers.docker.cache import load_manifest_cache
+    _m, _r, cfg = load_manifest_cache("envimg:1", HOST_ARCH)
+    assert "LD_LIBRARY_PATH=/opt/lib" in (cfg.get("config") or {}).get("Env")
+
+
+# --- the env the host-side exec is actually handed -------------------------
+#
+# The refusal above is about where a value came from; this is about where
+# it lands. proot's environment is the tracee's too, so the same dict is
+# read by the host's dynamic loader before proot has confined anything --
+# and the child fchdir's into the stage rootfs between the fork and the
+# exec, so a *relative* entry names a directory an earlier RUN step wrote.
+
+
+def _child_env(env=None, args=None, quiet=True):
+    stage = _Stage()
+    stage.env = dict(env or {})
+    stage.args = dict(args or {})
+    stage.declared_args = set(stage.args)
+    engine = SimpleNamespace(warned_host_exec=set())
+    return run_step._build_child_env(engine, stage), engine
+
+
+def test_a_dockerfile_env_cannot_reach_the_host_side_exec(monkeypatch):
+    monkeypatch.delenv("PROOT_NO_SECCOMP", raising=False)
+    env, _engine = _child_env({
+        "LD_LIBRARY_PATH": "lib",
+        "LD_AUDIT": "lib/audit.so",
+        "LD_PRELOAD": "/evil/pre.so",
+        "PROOT_NO_SECCOMP": "1",
+        "SAFE": "1",
+    })
+    for key in ("LD_LIBRARY_PATH", "LD_AUDIT", "LD_PRELOAD"):
+        assert key not in env
+    assert env["SAFE"] == "1"
+    # proot's own knobs go the same way: what reaches the exec is what
+    # the invoking environment says, which here says nothing.
+    assert "PROOT_NO_SECCOMP" not in env
+
+
+def test_a_declared_arg_is_the_same_door():
+    env, _engine = _child_env(args={"LD_AUDIT": "lib/audit.so", "OK": "2"})
+    assert "LD_AUDIT" not in env
+    assert env["OK"] == "2"
+
+
+def test_the_users_own_proot_toggles_still_reach_the_exec(monkeypatch):
+    monkeypatch.setenv("PROOT_NO_SECCOMP", "1")
+    env, _engine = _child_env({"PROOT_NO_SECCOMP": "0"})
+    assert env["PROOT_NO_SECCOMP"] == "1"
+
+
+def test_the_refusal_is_reported_once_per_name(capsys):
+    stage = _Stage()
+    stage.env = {"LD_LIBRARY_PATH": "lib"}
+    engine = SimpleNamespace(warned_host_exec=set())
+    run_step._build_child_env(engine, stage)
+    run_step._build_child_env(engine, stage)
+    err = capsys.readouterr().err
+    assert err.count("LD_LIBRARY_PATH") == 1
+
+
+def test_the_dockerfiles_own_path_still_decides_the_guests(monkeypatch):
+    # PATH is the guest's to set and is deliberately not refused; what
+    # keeps it from choosing the binary this process becomes is that
+    # get_proot_bin() answers absolutely.
+    env, _engine = _child_env({"PATH": "/opt/bin"})
+    assert env["PATH"] == "/opt/bin"

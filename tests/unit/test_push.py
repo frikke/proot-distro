@@ -1,0 +1,670 @@
+# Tests for proot_distro.helpers.docker.push — that registry uploads handle
+# HTTP errors the same way as the install/pull path: transient failures (5xx)
+# are retried via the shared retry_http policy, while deterministic ones (4xx)
+# fail fast. The opener is mocked; no network.
+
+import email.message
+import hashlib
+import io
+import os
+
+import urllib.error
+import urllib.request
+
+import pytest
+
+from proot_distro.helpers import download
+from proot_distro.helpers.docker import push
+
+
+@pytest.fixture(autouse=True)
+def _no_retry_sleep(monkeypatch):
+    # Uploads share download.retry_http; neutralise its sleep so tests
+    # exercising transient (retryable) failures don't actually wait.
+    monkeypatch.setattr(download.time, "sleep", lambda *a, **k: None)
+
+
+class _FakeResp:
+    def __init__(self, status=200, headers=None):
+        self.status = status
+        self.headers = headers or {}
+
+    def read(self, *a):
+        return b""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _FakeOpener:
+    """Stand-in for transport.auth_opener()."""
+
+    def __init__(self, fn):
+        self._fn = fn
+
+    def open(self, req, *a, **k):
+        return self._fn(req, *a, **k)
+
+
+def _patch_opener(monkeypatch, fn):
+    monkeypatch.setattr(push, "opener", lambda insecure=False: _FakeOpener(fn))
+
+
+_BASE = "https://reg.example"
+
+
+def _http_error(url, code, reason):
+    return urllib.error.HTTPError(url, code, reason, email.message.Message(),
+                                  None)
+
+
+# ----- _blob_exists -------------------------------------------------------
+
+def test_blob_exists_true_on_200(monkeypatch):
+    _patch_opener(monkeypatch, lambda req, *a, **k: _FakeResp(200))
+    assert push._blob_exists("me/app", "sha256:aa", "TKN", _BASE) is True
+
+
+def test_blob_exists_false_on_404_no_retry(monkeypatch):
+    # A 404 means "blob absent" — deterministic, must not be retried.
+    calls = []
+
+    def fake(req, *a, **k):
+        calls.append(req.full_url)
+        raise _http_error(req.full_url, 404, "Not Found")
+
+    _patch_opener(monkeypatch, fake)
+    assert push._blob_exists("me/app", "sha256:aa", "TKN", _BASE) is False
+    assert len(calls) == 1
+
+
+def test_blob_exists_retries_transient(monkeypatch):
+    # A 5xx is transient: retried (same policy as install) then succeeds.
+    calls = []
+
+    def fake(req, *a, **k):
+        calls.append(req.full_url)
+        if len(calls) < 3:
+            raise _http_error(req.full_url, 503, "Service Unavailable")
+        return _FakeResp(200)
+
+    _patch_opener(monkeypatch, fake)
+    assert push._blob_exists("me/app", "sha256:aa", "TKN", _BASE) is True
+    assert len(calls) == 3
+
+
+def test_blob_exists_auth_error_propagates(monkeypatch):
+    # 401 is deterministic: not retried, propagates for push_denied_msg.
+    calls = []
+
+    def fake(req, *a, **k):
+        calls.append(req.full_url)
+        raise _http_error(req.full_url, 401, "Unauthorized")
+
+    _patch_opener(monkeypatch, fake)
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        push._blob_exists("me/app", "sha256:aa", "TKN", _BASE)
+    assert exc.value.code == 401
+    assert len(calls) == 1
+
+
+def test_blob_exists_uses_insecure_opener(monkeypatch):
+    # The insecure flag must reach transport.opener so --allow-insecure pushes
+    # over the unverified/HTTP opener, mirroring the install path.
+    seen = {}
+
+    def fake_opener(insecure=False):
+        seen["insecure"] = insecure
+        return _FakeOpener(lambda req, *a, **k: _FakeResp(200))
+
+    monkeypatch.setattr(push, "opener", fake_opener)
+    assert push._blob_exists(
+        "me/app", "sha256:aa", "TKN", "http://reg.example", insecure=True
+    ) is True
+    assert seen["insecure"] is True
+
+
+# ----- _put_manifest ------------------------------------------------------
+
+def test_put_manifest_retries_then_returns_digest(monkeypatch):
+    calls = []
+
+    def fake(req, *a, **k):
+        calls.append(req.full_url)
+        if len(calls) < 2:
+            raise _http_error(req.full_url, 500, "Internal Server Error")
+        return _FakeResp(201, {"Docker-Content-Digest": "sha256:dd"})
+
+    _patch_opener(monkeypatch, fake)
+    digest = push._put_manifest(
+        "me/app", "latest", b"{}",
+        "application/vnd.oci.image.manifest.v1+json", "TKN", _BASE,
+    )
+    assert digest == "sha256:dd"
+    assert len(calls) == 2
+
+
+# ----- _upload_blob_bytes -------------------------------------------------
+
+def test_upload_blob_bytes_retries_whole_session(monkeypatch):
+    # A transient failure on the POST re-runs the whole upload session
+    # (POST then monolithic PUT).
+    methods = []
+
+    def fake(req, *a, **k):
+        methods.append(req.get_method())
+        if req.get_method() == "POST":
+            if methods.count("POST") == 1:
+                raise _http_error(req.full_url, 503, "Service Unavailable")
+            return _FakeResp(202, {"Location": "https://reg.example/upload/1"})
+        return _FakeResp(201)  # PUT
+
+    _patch_opener(monkeypatch, fake)
+    push._upload_blob_bytes("me/app", "sha256:cc", b"data", "TKN", _BASE)
+    assert methods == ["POST", "POST", "PUT"]
+
+
+def test_upload_blob_bytes_4xx_fails_fast(monkeypatch):
+    calls = []
+
+    def fake(req, *a, **k):
+        calls.append(req.get_method())
+        raise _http_error(req.full_url, 403, "Forbidden")
+
+    _patch_opener(monkeypatch, fake)
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        push._upload_blob_bytes("me/app", "sha256:cc", b"data", "TKN", _BASE)
+    assert exc.value.code == 403
+    assert calls == ["POST"]  # deterministic -> no retry
+
+
+@pytest.mark.parametrize("location", [
+    "https://[x/upload/1",               # urllib: Invalid IPv6 URL
+    "https://[::1/upload/1",
+])
+def test_upload_location_that_is_not_a_url_is_an_invalid_request(
+    monkeypatch, location, tmp_path,
+):
+    # The Location is the registry's text. One urllib cannot parse was a
+    # ValueError out of the upload -- past push's net, a traceback -- and
+    # it is not worth a retry: the same session answers the same way.
+    methods = []
+
+    def fake(req, *a, **k):
+        methods.append(req.get_method())
+        return _FakeResp(202, {"Location": location})
+
+    _patch_opener(monkeypatch, fake)
+    with pytest.raises(download.InvalidRequest):
+        push._upload_blob_bytes("me/app", "sha256:cc", b"data", "TKN", _BASE)
+    assert methods == ["POST"]
+
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"data")
+    fd = os.open(str(blob), os.O_RDONLY)
+    methods.clear()
+    try:
+        with pytest.raises(download.InvalidRequest):
+            push._upload_blob_fd("me/app", "sha256:cc", fd, "TKN", _BASE)
+    finally:
+        os.close(fd)
+    assert methods == ["POST"]
+
+
+# ----- upload Location: the token stays on the registry -------------------
+
+def _capture_put_auth(monkeypatch, location):
+    """Drive one upload session; return the PUT's URL and Authorization."""
+    seen = {}
+
+    def fake(req, *a, **k):
+        if req.get_method() == "POST":
+            assert req.get_header("Authorization") == "Bearer TKN"
+            return _FakeResp(202, {"Location": location})
+        seen["url"] = req.full_url
+        seen["auth"] = req.get_header("Authorization")
+        return _FakeResp(201)
+
+    _patch_opener(monkeypatch, fake)
+    return seen
+
+
+@pytest.mark.parametrize("location", [
+    "https://evil.example/upload/1",     # another host
+    "http://reg.example/upload/1",       # the registry, in clear
+    "https://reg.example:8443/upload/1", # the registry, another port
+])
+def test_upload_put_off_the_registry_origin_carries_no_token(
+    monkeypatch, location, tmp_path,
+):
+    # The Location is a header the registry's answer named; an absolute
+    # one can point anywhere, and the PUT used to reuse the POST's
+    # headers, token included. Docker's client sends nothing to another
+    # origin; neither does this.
+    seen = _capture_put_auth(monkeypatch, location)
+    push._upload_blob_bytes("me/app", "sha256:cc", b"data", "Bearer TKN",
+                            _BASE)
+    assert seen["url"].startswith(location)
+    assert seen["auth"] is None
+
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"data")
+    fd = os.open(str(blob), os.O_RDONLY)
+    try:
+        seen = _capture_put_auth(monkeypatch, location)
+        push._upload_blob_fd("me/app", "sha256:cc", fd, "Bearer TKN", _BASE)
+    finally:
+        os.close(fd)
+    assert seen["url"].startswith(location)
+    assert seen["auth"] is None
+
+
+@pytest.mark.parametrize("location", [
+    "/v2/me/app/blobs/uploads/1",             # relative, as most send it
+    "https://reg.example/v2/me/app/uploads/1", # absolute, same origin
+    "https://reg.example:443/uploads/1",       # the default port spelled out
+])
+def test_upload_put_on_the_registry_keeps_the_token(monkeypatch, location):
+    seen = _capture_put_auth(monkeypatch, location)
+    push._upload_blob_bytes("me/app", "sha256:cc", b"data", "Bearer TKN",
+                            _BASE)
+    assert seen["url"].startswith("https://reg.example")
+    assert seen["auth"] == "Bearer TKN"
+
+
+def test_upload_put_keeps_the_token_on_an_https_upgrade(monkeypatch):
+    # An --allow-insecure push resolved to an http base whose registry
+    # sends uploads to its own https endpoint: the same server, more
+    # securely, so the token goes along.
+    seen = _capture_put_auth(monkeypatch, "https://reg.example/uploads/1")
+    push._upload_blob_bytes("me/app", "sha256:cc", b"data", "Bearer TKN",
+                            "http://reg.example", insecure=True)
+    assert seen["auth"] == "Bearer TKN"
+
+
+# ----- push_image: --allow-insecure threading -----------------------------
+
+@pytest.mark.parametrize("manifest", [
+    "a manifest",                                   # not an object
+    {"layers": {"digest": "sha256:" + "a" * 64}},   # not a list
+    {"layers": [42]},                               # not a descriptor
+    {"layers": [{"size": 1}]},                      # names no digest
+])
+def test_push_refuses_a_malformed_cached_manifest(monkeypatch, manifest):
+    # The manifest cache is a directory a container can write to on
+    # Termux; a manifest of the wrong shape must not be a traceback.
+    monkeypatch.setattr(push, "load_manifest_cache",
+                        lambda ref, arch: (manifest, "me/app", {}))
+    with pytest.raises(RuntimeError):
+        push.push_image("reg.example/me/app:latest", "x86_64")
+
+
+def test_push_image_threads_base_and_insecure(monkeypatch):
+    # push_image must resolve the scheme/base via get_auth_token(insecure=...)
+    # and thread that base + the insecure flag into every upload helper, so an
+    # HTTP-only (or bad-cert) registry is pushed to over the resolved transport.
+    cfg_bytes = b"CFG"
+    cfg_digest = "sha256:" + hashlib.sha256(cfg_bytes).hexdigest()
+    layer_digest = "sha256:" + "a" * 64
+    manifest = {
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"digest": cfg_digest},
+        "layers": [{"digest": layer_digest}],
+    }
+
+    monkeypatch.setattr(push, "load_manifest_cache",
+                        lambda ref, arch: (manifest, "me/app", {"k": "v"}))
+    monkeypatch.setattr(push, "canonical_json", lambda d: cfg_bytes)
+    monkeypatch.setattr(push, "blob_present", lambda d: True)
+
+    captured = {}
+
+    def fake_auth(repo, registry, actions="pull", insecure=False):
+        captured["auth_insecure"] = insecure
+        # HTTP-only registry resolved to an http base under --allow-insecure.
+        return "TKN", "http://reg.example"
+
+    monkeypatch.setattr(push, "get_auth_token", fake_auth)
+
+    def fake_blob_exists(repo, digest, token, base, insecure=False):
+        captured["blob_base"] = base
+        captured["blob_insecure"] = insecure
+        return True  # everything already present -> skip uploads
+
+    monkeypatch.setattr(push, "_blob_exists", fake_blob_exists)
+
+    def fake_put_manifest(repo, ref, body, media, token, base, insecure=False):
+        captured["manifest_base"] = base
+        captured["manifest_insecure"] = insecure
+        return "sha256:dd"
+
+    monkeypatch.setattr(push, "_put_manifest", fake_put_manifest)
+
+    result = push.push_image(
+        "reg.example/me/app:latest", "x86_64", insecure=True
+    )
+
+    assert captured["auth_insecure"] is True
+    assert captured["blob_base"] == "http://reg.example"
+    assert captured["blob_insecure"] is True
+    assert captured["manifest_base"] == "http://reg.example"
+    assert captured["manifest_insecure"] is True
+    assert result["manifest_digest"] == "sha256:dd"
+
+
+def test_push_asks_for_a_credential_that_can_push(monkeypatch, tmp_path):
+    # Every other push test fakes get_auth_token without looking at
+    # *actions*, so a push asking for "pull" alone -- answered by every
+    # token service with a token that cannot upload -- passed them all.
+    _pushable(monkeypatch, tmp_path)
+    seen = {}
+
+    def fake_auth(repo, registry, actions="pull", insecure=False):
+        seen.update(repo=repo, registry=registry, actions=actions)
+        return "Bearer TKN", _BASE
+
+    monkeypatch.setattr(push, "get_auth_token", fake_auth)
+    push.push_image("reg.example/me/app:1", "x86_64")
+    assert seen == {"repo": "me/app", "registry": "reg.example",
+                    "actions": "pull,push"}
+
+
+@pytest.mark.parametrize("auth", [
+    "Bearer TKN",                       # a token service's grant
+    "Basic YWxpY2U6c2VjcmV0",           # a registry checking passwords itself
+])
+def test_every_push_request_carries_the_resolved_authorization(
+        monkeypatch, tmp_path, auth):
+    real = {name: getattr(push, name) for name in (
+        "_blob_exists", "_upload_blob_fd", "_upload_blob_bytes",
+        "_put_manifest")}
+    _pushable(monkeypatch, tmp_path)
+    for name, fn in real.items():
+        monkeypatch.setattr(push, name, fn)
+    monkeypatch.setattr(push, "get_auth_token",
+                        lambda *a, **k: (auth, _BASE))
+    sent = []
+
+    def fake(req, *a, **k):
+        sent.append((req.get_method(), req.get_header("Authorization")))
+        if req.get_method() == "HEAD":
+            raise _http_error(req.full_url, 404, "Not Found")
+        if req.get_method() == "POST":
+            return _FakeResp(202, {"Location": "/v2/me/app/blobs/uploads/1"})
+        return _FakeResp(201)
+
+    _patch_opener(monkeypatch, fake)
+    push.push_image("reg.example/me/app:1", "x86_64")
+    # Layer and config: probe, upload session, upload. Then the manifest.
+    assert [m for m, _a in sent] == ["HEAD", "POST", "PUT"] * 2 + ["PUT"]
+    assert all(a == auth for _m, a in sent)
+
+
+# ----- timeouts -----------------------------------------------------------
+
+def test_upload_timeout_grows_with_the_blob():
+    # The PUT completing an upload is answered once the registry has
+    # committed the blob, which takes longer the larger it is; a flat
+    # timeout would give up on a large layer every time.
+    assert push._upload_timeout(0) == download.NETWORK_TIMEOUT
+    assert push._upload_timeout(10 * 1024 * 1024) == download.NETWORK_TIMEOUT
+    big = 4 * 1024 ** 3
+    assert push._upload_timeout(big) == big / push._COMMIT_RATE
+    assert push._upload_timeout(big) > download.NETWORK_TIMEOUT
+
+
+def test_blob_put_carries_the_upload_timeout(monkeypatch, tmp_path):
+    timeouts = {}
+
+    def fake(req, *a, **k):
+        timeouts[req.get_method()] = k.get("timeout")
+        if req.get_method() == "POST":
+            return _FakeResp(202, {"Location": "https://reg.example/up/1"})
+        return _FakeResp(201)
+
+    _patch_opener(monkeypatch, fake)
+    monkeypatch.setattr(push, "_upload_timeout", lambda size: 1234.0 + size)
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"data")
+    fd = os.open(str(blob), os.O_RDONLY)
+    try:
+        push._upload_blob_fd("me/app", "sha256:cc", fd, "TKN", _BASE)
+    finally:
+        os.close(fd)
+    # The session's POST keeps the opener's default; the PUT that waits
+    # on the commit gets the one sized for the blob.
+    assert timeouts == {"POST": None, "PUT": 1238.0}
+
+
+# ----- Docker Hub is always verified --------------------------------------
+
+@pytest.mark.parametrize("ref,registry,expected", [
+    ("me/app:latest", "", False),                  # Docker Hub
+    ("reg.example/me/app:latest", "reg.example", True),
+])
+def test_push_image_keeps_docker_hub_verified(monkeypatch, ref, registry,
+                                              expected):
+    # --allow-insecure is Docker's --insecure-registry: it reaches a
+    # registry the user names, never Docker Hub. push handed it to every
+    # upload helper whatever the registry, so a Hub push ran its blob
+    # probes, uploads and manifest PUT -- Bearer token and all -- with
+    # certificate checks off.
+    cfg_bytes = b"CFG"
+    manifest = {
+        "config": {"digest": "sha256:" + hashlib.sha256(cfg_bytes).hexdigest()},
+        "layers": [{"digest": "sha256:" + "a" * 64}],
+    }
+    monkeypatch.setattr(push, "load_manifest_cache",
+                        lambda r, a: (manifest, "me/app", {"k": "v"}))
+    monkeypatch.setattr(push, "canonical_json", lambda d: cfg_bytes)
+    monkeypatch.setattr(push, "blob_present", lambda d: True)
+    seen = []
+
+    def fake_auth(repo, reg, actions="pull", insecure=False):
+        assert reg == registry
+        seen.append(insecure)
+        return "TKN", "https://x"
+
+    def fake_exists(repo, digest, token, base, insecure=False):
+        seen.append(insecure)
+        return True
+
+    def fake_put(repo, tag, body, media, token, base, insecure=False):
+        seen.append(insecure)
+        return ""
+
+    monkeypatch.setattr(push, "get_auth_token", fake_auth)
+    monkeypatch.setattr(push, "_blob_exists", fake_exists)
+    monkeypatch.setattr(push, "_put_manifest", fake_put)
+    push.push_image(ref, "x86_64", insecure=True)
+    assert seen and all(flag is expected for flag in seen)
+
+
+# ----- the repository is the reference's, never the cache entry's ----------
+
+def test_push_image_uploads_to_the_references_repository(monkeypatch):
+    # The entry's `repo` is a file a guest can write on Termux, and it
+    # used to decide where the blobs, the push-scoped token and the tag
+    # went: `push me/app:1` could overwrite `me/important:1`.
+    cfg_bytes = b"CFG"
+    cfg_digest = "sha256:" + hashlib.sha256(cfg_bytes).hexdigest()
+    manifest = {
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"digest": cfg_digest},
+        "layers": [{"digest": "sha256:" + "a" * 64}],
+    }
+    monkeypatch.setattr(push, "load_manifest_cache",
+                        lambda ref, arch: (manifest, "me/important",
+                                           {"k": "v"}))
+    monkeypatch.setattr(push, "canonical_json", lambda d: cfg_bytes)
+    monkeypatch.setattr(push, "blob_present", lambda d: True)
+
+    repos = []
+
+    def fake_auth(repo, registry, actions="pull", insecure=False):
+        repos.append(("auth", repo))
+        return "TKN", "https://reg.example"
+
+    def fake_blob_exists(repo, digest, token, base, insecure=False):
+        repos.append(("blob", repo))
+        return True
+
+    def fake_put_manifest(repo, ref, body, media, token, base,
+                          insecure=False):
+        repos.append(("manifest", repo, ref))
+        return "sha256:dd"
+
+    monkeypatch.setattr(push, "get_auth_token", fake_auth)
+    monkeypatch.setattr(push, "_blob_exists", fake_blob_exists)
+    monkeypatch.setattr(push, "_put_manifest", fake_put_manifest)
+
+    result = push.push_image("reg.example/me/app:1", "x86_64")
+    assert {entry[1] for entry in repos} == {"me/app"}
+    assert ("manifest", "me/app", "1") in repos
+    assert result["repo"] == "me/app"
+
+
+def test_push_image_refuses_a_digest_before_reading_the_cache(monkeypatch):
+    def no_cache(*_a):
+        raise AssertionError("the cache was consulted")
+
+    monkeypatch.setattr(push, "load_manifest_cache", no_cache)
+    with pytest.raises(RuntimeError, match="use a tag"):
+        push.push_image("reg.example/me/app@sha256:" + "a" * 64, "x86_64")
+
+
+# ----- 429 Too Many Requests ----------------------------------------------
+
+def _quota_spent(url, source=False):
+    hdrs = email.message.Message()
+    hdrs["RateLimit-Remaining"] = "0;w=3600"
+    if source:
+        hdrs["Docker-RateLimit-Source"] = "192.0.2.10"
+    return urllib.error.HTTPError(
+        url, 429, "Too Many Requests", hdrs, io.BytesIO(b""),
+    )
+
+
+def _pushable(monkeypatch, tmp_path):
+    """A cached image push_image will get as far as the network with."""
+    cfg_bytes = b"CFG"
+    manifest = {
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"digest": "sha256:" + hashlib.sha256(cfg_bytes).hexdigest()},
+        "layers": [{"digest": "sha256:" + "a" * 64}],
+    }
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"layer")
+    monkeypatch.setattr(push, "load_manifest_cache",
+                        lambda r, a: (manifest, "me/app", {"k": "v"}))
+    monkeypatch.setattr(push, "canonical_json", lambda d: cfg_bytes)
+    monkeypatch.setattr(push, "blob_present", lambda d: True)
+    monkeypatch.setattr(push, "open_required_layer",
+                        lambda d: os.open(blob, os.O_RDONLY))
+    monkeypatch.setattr(push, "get_auth_token",
+                        lambda *a, **k: ("TKN", _BASE))
+    monkeypatch.setattr(push, "_blob_exists", lambda *a, **k: False)
+    monkeypatch.setattr(push, "_upload_blob_fd", lambda *a, **k: None)
+    monkeypatch.setattr(push, "_upload_blob_bytes", lambda *a, **k: None)
+    monkeypatch.setattr(push, "_put_manifest", lambda *a, **k: "sha256:dd")
+
+
+def _refuse(*a, **k):
+    raise _quota_spent(_BASE + "/v2/me/app/blobs/uploads/")
+
+
+@pytest.mark.parametrize("stage", [
+    "get_auth_token", "_blob_exists", "_upload_blob_fd",
+    "_upload_blob_bytes", "_put_manifest",
+])
+def test_a_rate_limited_push_says_so_at_every_stage(monkeypatch, tmp_path,
+                                                    stage):
+    # Regression: a 429 anywhere in the push came out of command_push as
+    # "Network error: HTTP Error 429: Too Many Requests".
+    _pushable(monkeypatch, tmp_path)
+    monkeypatch.setattr(push, stage, _refuse)
+    with pytest.raises(RuntimeError) as exc:
+        push.push_image("reg.example/me/app:1", "x86_64")
+    text = str(exc.value)
+    assert "Registry 'reg.example' refused to accept" in text
+    assert "HTTP 429" in text
+    assert "to push with an account" in text
+
+
+def test_a_spent_quota_on_a_push_is_not_retried(monkeypatch, tmp_path):
+    # Through the real probe and opener: one request, then the message.
+    real_blob_exists = push._blob_exists
+    _pushable(monkeypatch, tmp_path)
+    monkeypatch.setattr(push, "_blob_exists", real_blob_exists)
+    calls = []
+
+    def refuse(req, *a, **k):
+        calls.append(req.full_url)
+        raise _quota_spent(req.full_url)
+
+    _patch_opener(monkeypatch, refuse)
+    with pytest.raises(RuntimeError) as exc:
+        push.push_image("reg.example/me/app:1", "x86_64")
+    assert "HTTP 429" in str(exc.value)
+    assert len(calls) == 1
+
+
+def test_other_http_errors_still_reach_the_command(monkeypatch, tmp_path):
+    _pushable(monkeypatch, tmp_path)
+
+    def bad_request(*a, **k):
+        raise _http_error(_BASE + "/v2/me/app/manifests/1", 400, "Bad")
+
+    monkeypatch.setattr(push, "_put_manifest", bad_request)
+    with pytest.raises(urllib.error.HTTPError):
+        push.push_image("reg.example/me/app:1", "x86_64")
+
+
+def test_auth_refusals_keep_their_own_message(monkeypatch, tmp_path):
+    _pushable(monkeypatch, tmp_path)
+
+    def denied(*a, **k):
+        raise _http_error(_BASE + "/v2/me/app/manifests/1", 403, "Denied")
+
+    monkeypatch.setattr(push, "_put_manifest", denied)
+    with pytest.raises(RuntimeError) as exc:
+        push.push_image("reg.example/me/app:1", "x86_64")
+    assert "Push denied" in str(exc.value)
+
+
+def _push_limit_msg(image_ref, exc):
+    from proot_distro.helpers.docker.refs import parse_tag_reference
+    return push._refusal_msg(image_ref, parse_tag_reference(image_ref), exc)
+
+
+def test_a_push_to_docker_hub_gets_no_pull_advice(monkeypatch):
+    monkeypatch.delenv("PD_DOCKER_AUTH", raising=False)
+    exc = _quota_spent("https://registry-1.docker.io/v2/me/app/blobs/x",
+                       source=True)
+    text = _push_limit_msg("me/app:1", exc)
+    assert text.startswith("Docker Hub refused to accept 'me/app:1'")
+    assert "anonymous pulls" not in text
+    assert "to push with a Docker Hub account" in text
+
+
+def test_a_push_to_a_docker_hub_front_end_is_not_sent_elsewhere(monkeypatch):
+    # The pull's advice -- install from the Docker Hub name -- is nothing
+    # a push can do: the image would have to be built under that name.
+    monkeypatch.delenv("PD_DOCKER_AUTH", raising=False)
+    exc = _quota_spent("https://hub-mirror.example/v2/me/app/blobs/x",
+                       source=True)
+    text = _push_limit_msg("hub-mirror.example/me/app:1", exc)
+    assert "passes requests on to Docker Hub" in text
+    assert "install it from there" not in text
+    assert "to push with a Docker Hub account" in text
+
+
+def test_a_rate_limited_push_with_credentials_is_the_accounts(monkeypatch):
+    monkeypatch.setenv("PD_DOCKER_AUTH", "u:p")
+    exc = _quota_spent(_BASE + "/v2/me/app/blobs/x")
+    text = _push_limit_msg("reg.example/me/app:1", exc)
+    assert "for the account in PD_DOCKER_AUTH" in text
+    assert "PD_DOCKER_AUTH=" not in text

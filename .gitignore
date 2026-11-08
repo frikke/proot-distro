@@ -1,2 +1,11 @@
-/rootfs/*
+/build/
+/dist/
+/rootfs/
+__pycache__
+*.egg-info
+*.pyc
 *.swp
+*.tar
+*.tar.bz2
+*.tar.gz
+*.tar.xz

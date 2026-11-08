@@ -1,0 +1,306 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The suite runs against proot built from termux/proot, the source of
+  # the proot Termux ships, not against the runner's distro package.
+  # Ubuntu 26.04's proot 5.4.0-3 confines nothing unless PROOT_NO_SECCOMP
+  # is set, so it is never installed here.
+  #
+  # The commit is pinned so that a push to termux/proot cannot change
+  # what this workflow tests. Bump PROOT_COMMIT to test a newer proot.
+  #
+  # One binary serves the whole matrix.
+  proot:
+    name: Build proot (termux/proot)
+    runs-on: ubuntu-26.04
+    env:
+      PROOT_REPO: https://github.com/termux/proot.git
+      PROOT_COMMIT: 968ae1be84c69a607dbcd43ee514ab04753d60c5
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          # gcc-multilib: proot embeds a 32-bit loader for i386 guests.
+          sudo apt-get install -yq --no-install-recommends \
+            build-essential gcc-multilib libtalloc-dev
+
+      - name: Build proot
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          src="${RUNNER_TEMP}/proot-src"
+          git init -q "${src}"
+          git -C "${src}" fetch -q --depth 1 "${PROOT_REPO}" "${PROOT_COMMIT}"
+          git -C "${src}" checkout -q --detach FETCH_HEAD
+          make -C "${src}/src" -j"$(nproc)" proot
+          install -D -m 0755 "${src}/src/proot" "${RUNNER_TEMP}/proot-bin/proot"
+          "${RUNNER_TEMP}/proot-bin/proot" --version
+
+      - name: Store proot
+        uses: actions/upload-artifact@v7
+        with:
+          name: proot
+          path: ${{ runner.temp }}/proot-bin/proot
+          if-no-files-found: error
+
+  test:
+    name: Test suite (Python ${{ matrix.python-version }}, ${{ matrix.os }})
+    needs: proot
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Cover the floor and the latest of the supported range
+        # (pyproject: requires-python = ">=3.9"). setup-python has no 3.9
+        # build for Ubuntu 26.04, so the floor stays on 24.04.
+        include:
+          - python-version: '3.9'
+            os: ubuntu-24.04
+          - python-version: '3.12'
+            os: ubuntu-26.04
+          - python-version: '3.15'
+            os: ubuntu-26.04
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: pyproject.toml
+
+      - name: Retrieve proot
+        uses: actions/download-artifact@v8
+        with:
+          name: proot
+          path: ${{ runner.temp }}/proot/bin
+
+      - name: Install proot
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -yq --no-install-recommends libtalloc2
+          # Artifacts do not keep the mode bits.
+          chmod 0755 "${RUNNER_TEMP}/proot/bin/proot"
+          echo "${RUNNER_TEMP}/proot/bin" >> "${GITHUB_PATH}"
+
+      - name: Check proot
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # Every later step must find this build, not some other proot.
+          test "$(command -v proot)" = "${RUNNER_TEMP}/proot/bin/proot"
+          proot --version
+          # It must confine: a bind is visible only through proot, so the
+          # shell finds the marker only if its own syscalls are translated.
+          probe="$(mktemp -d)"
+          touch "${probe}/marker"
+          proot -r / -b "${probe}:/pd-ci-probe" \
+            /bin/sh -c 'test -e /pd-ci-probe/marker'
+          rm -rf "${probe}"
+
+      - name: Install package with test extra
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[test]'
+
+      - name: Unit tests
+        run: python -m pytest tests/unit
+
+      - name: Integration tests
+        run: python -m pytest tests/integration
+
+      - name: Security tests
+        run: python -m pytest tests/security
+
+      - name: Live tests
+        run: RUN_LIVE_TESTS=1 python -m pytest -q tests/live
+
+      - name: User tests
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          PD=(./proot-distro.py)
+          WORKDIR="$(mktemp -d)"
+          export XDG_DATA_HOME="${WORKDIR}/data"
+          export XDG_CACHE_HOME="${WORKDIR}/cache"
+
+          cleanup() {
+            set +e
+            "${PD[@]}" kill --all >/dev/null 2>&1
+            for name in \
+              alpine-work alpine-restored alpine-built \
+              debian-work debian-restored \
+              ubuntu-work ubuntu-restored
+            do
+              "${PD[@]}" rm -q "${name}" >/dev/null 2>&1
+            done
+            rm -rf "${WORKDIR}"
+          }
+          trap cleanup EXIT
+
+          pd() {
+            "${PD[@]}" "$@"
+          }
+
+          assert_contains() {
+            local haystack="$1"
+            local needle="$2"
+            if [[ "${haystack}" != *"${needle}"* ]]; then
+              echo "Expected output to contain: ${needle}" >&2
+              echo "Actual output:" >&2
+              printf '%s\n' "${haystack}" >&2
+              return 1
+            fi
+          }
+
+          assert_file_contains() {
+            local file="$1"
+            local needle="$2"
+            grep -Fq "${needle}" "${file}"
+          }
+
+          assert_container_listed() {
+            local name="$1"
+            pd list -q | grep -Fx "${name}"
+          }
+
+          echo "::group::Docker Hub search"
+          # Table form names the official image; --quiet is the pipeable one.
+          assert_contains "$(pd search alpine --limit 5 2>&1)" "alpine"
+          pd search -q alpine --limit 5 | grep -Fx "alpine"
+          echo "::endgroup::"
+
+          echo "::group::Alpine Linux (3.24.1)"
+          pd install -n alpine-work alpine:3.24.1
+          assert_container_listed alpine-work
+          assert_contains "$(pd login alpine-work -- cat /etc/os-release)" "ID=alpine"
+          pd login alpine-work -- apk update
+          pd login alpine-work -- apk add --no-cache ca-certificates curl
+          assert_contains "$(pd login alpine-work -- curl --version)" "curl"
+
+          mkdir -p "${WORKDIR}/host-src/subdir"
+          printf 'from-host\n' > "${WORKDIR}/host-src/subdir/message.txt"
+          ln -s subdir/message.txt "${WORKDIR}/host-src/message-link"
+          pd sync --checksum --delete "${WORKDIR}/host-src" alpine-work:/opt/fixture
+          assert_contains "$(pd login alpine-work -- cat /opt/fixture/subdir/message.txt)" "from-host"
+          assert_contains "$(pd login alpine-work -- readlink /opt/fixture/message-link)" "subdir/message.txt"
+
+          printf 'replacement\n' > "${WORKDIR}/host-src/subdir/message.txt"
+          mkdir -p "${WORKDIR}/host-src/extra"
+          printf 'keep\n' > "${WORKDIR}/host-src/extra/keep.txt"
+          pd login alpine-work -- sh -c 'mkdir -p /opt/fixture/stale && echo stale > /opt/fixture/stale/remove-me'
+          pd sync --checksum --delete "${WORKDIR}/host-src" alpine-work:/opt/fixture
+          assert_contains "$(pd login alpine-work -- cat /opt/fixture/subdir/message.txt)" "replacement"
+          if pd login alpine-work -- test -e /opt/fixture/stale/remove-me; then
+            echo "sync --delete left stale data in the container" >&2
+            exit 1
+          fi
+
+          pd copy alpine-work:/opt/fixture/subdir/message.txt "${WORKDIR}/copied-from-alpine.txt"
+          assert_file_contains "${WORKDIR}/copied-from-alpine.txt" "replacement"
+          pd login alpine-work -- sh -c 'mkdir -p /tmp/move-src && echo moved > /tmp/move-src/file.txt'
+          pd copy --move alpine-work:/tmp/move-src/file.txt alpine-work:/tmp/moved-file.txt
+          assert_contains "$(pd login alpine-work -- cat /tmp/moved-file.txt)" "moved"
+          if pd login alpine-work -- test -e /tmp/move-src/file.txt; then
+            echo "copy --move left the source file behind" >&2
+            exit 1
+          fi
+
+          assert_contains "$(pd login alpine-work --env PD_USER_TEST=ok --work-dir /opt/fixture --bind "${WORKDIR}:/host-fixture" -- sh -c 'printf "%s:%s:%s" "$PD_USER_TEST" "$PWD" "$(cat /host-fixture/copied-from-alpine.txt)"')" "ok:/opt/fixture:replacement"
+
+          pd login alpine-work --detach -- sh -c 'while :; do sleep 1; done'
+          sleep 2
+          assert_contains "$(pd ps 2>&1)" "alpine-work"
+          test -n "$(pd ps -q)"
+          pd kill alpine-work
+          sleep 1
+          if [[ -n "$(pd ps -q)" ]]; then
+            echo "detached session was still active after kill" >&2
+            pd ps
+            exit 1
+          fi
+
+          cat > "${WORKDIR}/host-src/Dockerfile" <<'EOF'
+          FROM alpine:3.24.1
+          COPY subdir/message.txt /usr/local/share/message.txt
+          ENV BUILT_BY=proot-distro-user-tests
+          WORKDIR /usr/local/share
+          CMD ["/bin/sh", "-c", "printf '%s:%s:%s\n' \"$BUILT_BY\" \"$PWD\" \"$(cat message.txt)\""]
+          EOF
+          pd build -t user-tests/alpine-built:1 --install-as alpine-built "${WORKDIR}/host-src"
+          assert_contains "$(pd run alpine-built)" "proot-distro-user-tests:/usr/local/share:replacement"
+
+          pd rename alpine-work alpine-restored
+          pd backup -o "${WORKDIR}/alpine-restored.tar.gz" alpine-restored
+          pd rm alpine-restored
+          pd restore "${WORKDIR}/alpine-restored.tar.gz"
+          assert_container_listed alpine-restored
+          assert_contains "$(pd login alpine-restored -- cat /opt/fixture/subdir/message.txt)" "replacement"
+          pd reset alpine-restored
+          assert_contains "$(pd login alpine-restored -- cat /etc/os-release)" "ID=alpine"
+          if pd login alpine-restored -- test -e /opt/fixture/subdir/message.txt; then
+            echo "reset did not clear container-local data" >&2
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Debian (trixie)"
+          pd install -n debian-work debian:trixie
+          assert_container_listed debian-work
+          assert_contains "$(pd login debian-work -- cat /etc/os-release)" "ID=debian"
+          pd login debian-work -- apt update
+          pd login debian-work -- sh -c 'apt install -y --no-install-recommends ca-certificates file && rm -rf /var/lib/apt/lists/*'
+          assert_contains "$(pd login debian-work -- file /bin/sh)" "symbolic link"
+          pd login debian-work -- sh -c 'mkdir -p /srv/app && printf debian-data > /srv/app/data.txt'
+          pd copy -r debian-work:/srv/app "${WORKDIR}/debian-app"
+          assert_file_contains "${WORKDIR}/debian-app/data.txt" "debian-data"
+          pd rename debian-work debian-restored
+          pd backup -o "${WORKDIR}/debian-restored.tar.xz" debian-restored
+          pd rm debian-restored
+          pd restore "${WORKDIR}/debian-restored.tar.xz"
+          assert_contains "$(pd login debian-restored -- cat /srv/app/data.txt)" "debian-data"
+          echo "::endgroup::"
+
+          echo "::group::Ubuntu (24.04)"
+          pd install -n ubuntu-work ubuntu:24.04
+          assert_container_listed ubuntu-work
+          assert_contains "$(pd login ubuntu-work -- cat /etc/os-release)" "ID=ubuntu"
+          pd login ubuntu-work -- apt update
+          pd login ubuntu-work -- sh -c 'apt install -y --no-install-recommends adduser && rm -rf /var/lib/apt/lists/*'
+          pd login ubuntu-work -- sh -c 'useradd -m -s /bin/sh ciuser && echo user-data > /home/ciuser/data.txt && chown ciuser:ciuser /home/ciuser/data.txt'
+          assert_contains "$(pd login ubuntu-work --user ciuser -- sh -c 'printf "%s:%s:%s" "$USER" "$HOME" "$(cat ~/data.txt)"')" "ciuser:/home/ciuser:user-data"
+          pd login ubuntu-work -- sh -c 'mkdir -p /var/tmp/sync-src && echo before > /var/tmp/sync-src/value.txt'
+          pd sync ubuntu-work:/var/tmp/sync-src "${WORKDIR}/ubuntu-sync"
+          assert_file_contains "${WORKDIR}/ubuntu-sync/value.txt" "before"
+          pd rename ubuntu-work ubuntu-restored
+          pd backup -o "${WORKDIR}/ubuntu-restored.tar.gz" ubuntu-restored
+          pd rm ubuntu-restored
+          pd restore "${WORKDIR}/ubuntu-restored.tar.gz"
+          assert_contains "$(pd login ubuntu-restored --user ciuser -- cat /home/ciuser/data.txt)" "user-data"
+          echo "::endgroup::"
+
+          echo "::group::Cleanup and cache"
+          pd rm alpine-restored
+          pd rm alpine-built
+          pd rm debian-restored
+          pd rm ubuntu-restored
+          pd clear-cache
+          echo "::endgroup::"

@@ -1,37 +1,63 @@
 name: "Bug report"
-description: "Create a report to help us improve"
+description: "Tell us about issue with proot-distro utility"
 title: "[Bug]: "
 labels: ["bug report"]
 body:
   - type: markdown
     attributes:
       value: |
-        This is a bug tracker of the PRoot Distro - a Bash script utility for managing distribution rootfs for use with PRoot.
+        This is a bug tracker of the PRoot Distro - a helper script for PRoot to manage distribution installations. Please use it accordingly to selected ticket type.
 
-        **NOTE**: crashes, package installation issues and other distribution runtime bugs ARE NOT issues of PRoot Distro and will not be reviewed/fixed.
-
-        Be patient, do not expect that issue could get resolved immediately.
+        You acknowledge that false or incomplete information will make debugging impossible and you agree to collaborate with maintainers. We may request specific details or to run commands to get more information about the issue.
   - type: textarea
     attributes:
       label: Problem description
       description: |
-        A clear and concise description of what the problem is. You may attach the logs, screenshots, screen video recording and whatever else that will help to understand the issue.
-
-        Issues without proper description will be closed without solution.
+        A clear and concise description of what the problem is. Issue must be backed by proof: log, screenshot, video recording and everything else that will help us to understand the situation.
     validations:
       required: true
   - type: textarea
     attributes:
       label: What steps will reproduce the bug?
+      description: |
+        Give step-by-step instructions to reproduce issue with 100% success rate.
     validations:
       required: true
   - type: textarea
     attributes:
       label: What is the expected behavior?
-  - type: checkboxes
+  - type: input
     attributes:
-      label: Bug report policy acknowledgement
-      description: PRoot Distro provides distributions as-is, without binary modification of any kind. Upstream issues as well as issues of `proot` utility are not subject for bug reporting and will be ignored by PRoot Distro maintainers.
-      options:
-        - label: I understand that PRoot Distro won't fix distribution issues.
-          required: true
+      label: Android OS version
+      description: |
+        Android version number (e.g. 7.0). If you use proot-distro on a genuine Linux host, put here value 'PC', optionally with name of distribution.
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Kernel information (uname -a)
+      description: |
+        Put here a complete output of `uname -a`.
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: PRoot-Distro version
+      description: |
+        Put here information from `apt show proot-distro` or from `proot-distro help` version footer.
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: PRoot version
+      description: |
+        Put here information from `proot --version`.
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Termux application version
+      description: |
+        Full version information about Termux app. Tell whether this is Play Store build, F-Droid or something else. Put value 'PC' if you run proot-distro on a genuine Linux host and not on Termux.
+    validations:
+      required: true
